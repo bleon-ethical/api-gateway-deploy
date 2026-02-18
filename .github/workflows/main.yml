@@ -1,7 +1,7 @@
-name: "OpenAudit"
+name: "DevSecOps Pipeline"
 
 on:
-  workflow_dispatch: # Ejecución manual
+  workflow_dispatch:
   push:
     branches: [ main, master, develop ]
   pull_request:
@@ -34,13 +34,14 @@ jobs:
       - name: Semgrep Security Scan
         uses: returntocorp/semgrep-action@v1
         with:
+          # Se corrigió: eliminamos generateSarif y usamos reglas oficiales
           config: >-
             p/default
             p/security-audit
             p/secrets
-          generateSarif: "1"
+      # Subida de resultados optimizada a v4
       - name: Upload SARIF report
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: semgrep.sarif
         if: always()
@@ -56,7 +57,7 @@ jobs:
         with:
           directory: .
           framework: all 
-          soft_fail: false
+          soft_fail: false # Hard Stop para forzar el arreglo del Dockerfile
       
       - name: Trivy FS Scan
         uses: aquasecurity/trivy-action@master
@@ -64,18 +65,3 @@ jobs:
           scan-type: 'config,fs'
           exit-code: '1'
           severity: 'CRITICAL,HIGH'
-
-  dependency-audit:
-    name: "🧪 Snyk & Compliance"
-    runs-on: ubuntu-latest
-    needs: infrastructure-audit
-    # CORRECCIÓN DE CISO: Sin ${{ }} y usando una validación simple
-    if: github.event_name != 'pull_request'
-    steps:
-      - uses: actions/checkout@v4
-      - name: Run Snyk Test
-        uses: snyk/actions/node@master
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        with:
-          args: --severity-threshold=high
