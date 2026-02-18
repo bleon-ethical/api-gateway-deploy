@@ -1,4 +1,4 @@
-name: "Sec"
+name: "OpenAudit"
 
 on:
   # Permite ejecución manual desde la pestaña Actions
