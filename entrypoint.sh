@@ -1,136 +1,77 @@
 #!/bin/bash
 set -e
 
-ACCOUNT_ID=$(aws sts get-caller-identity | jq -r '.Account')
+ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text)
 
-aws eks update-kubeconfig --region ${AWS_DEFAULT_REGION} --name ${INPUT_EKS_CLUSTER_NAME}
+aws eks update-kubeconfig --region "${AWS_DEFAULT_REGION}" --name "${INPUT_EKS_CLUSTER_NAME}"
 
-if [ ! -z "$INPUT_ENVIRONMENT" ];
-then 
-    ENVIRONMENT=$INPUT_ENVIRONMENT
-fi
+ENVIRONMENT=${INPUT_ENVIRONMENT:-"default"}
+PROJECT=${INPUT_PROJECT}
+NAMESPACE=${INPUT_NAMESPACE:-"cpat"}
+SERVICE_NAME=${INPUT_SERVICE_NAME}
 
-PROJECT=$INPUT_PROJECT
+NLB_LIST=$(aws elbv2 describe-load-balancers --query 'LoadBalancers[?Type==`network`].[LoadBalancerArn, DNSName]' --output json)
 
-echo "Revisando load balancer asociado al servicio $SERVICE_NAME"
-NLB_LIST=$(aws elbv2 describe-load-balancers | jq -r ' [  .LoadBalancers[] | select( .Type=="network" ) | { arn: .LoadBalancerArn, hostname: .DNSName } ] ')
+EKS_SERVICE_HOSTNAME=$(kubectl get services -l "cpat.service=${SERVICE_NAME}" -n "${NAMESPACE}" -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}')
 
-EKS_SERVICE_HOSTNAME=$(/kubectl get services -l cpat.service=$SERVICE_NAME -n $INPUT_NAMESPACE -o json | jq -r ' .items[].status.loadBalancer.ingress[].hostname')
-
-echo "Buscando NLB: $EKS_SERVICE_HOSTNAME"
-
-if [ -z "$EKS_SERVICE_HOSTNAME" ];
-then
-    echo "No se ha encontrado el servicio etiquetado como $EKS_SERVICE_HOSTNAME"
-    echo "Revisar que la etiqueta (label) 'cpat.service' tenga el nombre del servicio $EKS_SERVICE_HOSTNAME"
-    exit 1
-fi
-# Al menos un NLB debe salir desde acá, si no lo hay, se supone que no se ha levantado
-ARN=$(echo $NLB_LIST | jq --arg h $EKS_SERVICE_HOSTNAME -r '.[] | select( .hostname == $h ) | .arn' )
-
-if [ -z "$ARN" ];
-then
-    echo "El servicio $SERVICE_NAME, no tiene asociado un NLB"
+if [ -z "$EKS_SERVICE_HOSTNAME" ]; then
     exit 1
 fi
 
-# Listar los links que estan desplegados
-VPC_LINK_ID=$(aws apigateway get-vpc-links | jq -r --arg t $ARN ' .items[] | select( .targetArns[] == $t ) | .id ')
-echo "Resultado de la busqueda: $VPC_LINK_ID"
-echo "Verificar si existe VPC Link"
+ARN=$(echo "$NLB_LIST" | jq --arg h "$EKS_SERVICE_HOSTNAME" -r '.[] | select(.[1] == $h) | .[0]')
 
-if [ -z "$VPC_LINK_ID" ];
-then
-    echo "No existe el VPC Link, procediendo a crearlo"
-    echo "$PROJECT-$SERVICE_NAME-$ENVIRONMENT-link"
-#   echo "$SERVICE_NAME-link"
+if [ -z "$ARN" ]; then
+    exit 1
+fi
 
+VPC_LINK_ID=$(aws apigateway get-vpc-links --query "items[?targetArns[0]=='$ARN'].id" --output text)
+
+if [ -z "$VPC_LINK_ID" ] || [ "$VPC_LINK_ID" == "None" ]; then
+    VPC_LINK_NAME="${PROJECT}-${SERVICE_NAME}-${ENVIRONMENT}-link"
+    
     VPC_LINK_RES=$(aws apigateway create-vpc-link \
-        --name "$PROJECT-$SERVICE_NAME-$ENVIRONMENT-link" \
-        --description "Link para API servicio $SERVICE_NAME en ambiente $ENVIRONMENT" \
+        --name "$VPC_LINK_NAME" \
+        --description "Link para API servicio $SERVICE_NAME" \
         --target-arns "$ARN" \
         --tags "Environment=$ENVIRONMENT,Project=$PROJECT,Purpose=API")
 
-    echo $VPC_LINK_RES
-
-    VPC_LINK_ID=$(echo $VPC_LINK_RES | jq -r '.id' )
-else
-    echo "Ya existe NLB para el servicio $SERVICE_NAME"
-    echo "VPCLink ID: $VPC_LINK_ID"
+    VPC_LINK_ID=$(echo "$VPC_LINK_RES" | jq -r '.id')
 fi
 
-# Actualizando API
-API_NAME="$PROJECT-$ENVIRONMENT-$SERVICE_NAME-api"
+API_NAME="${PROJECT}-${ENVIRONMENT}-${SERVICE_NAME}-api"
+cp "./$INPUT_SWAGGER_PATH" ./swagger_temp.yaml
 
-# Check si existe API gateway
-API_DATA=$(aws apigateway get-rest-apis | jq -r --arg n $API_NAME ' .items[] | select( .name == $n)')
+sed -i "s|API_NAME|${API_NAME}|g" ./swagger_temp.yaml
+sed -i "s|ACCOUNT_ID|${ACCOUNT_ID}|g" ./swagger_temp.yaml
+sed -i "s|REGION|${AWS_DEFAULT_REGION}|g" ./swagger_temp.yaml
+sed -i "s|CORS_DOMAIN|${INPUT_CORS_DOMAIN}|g" ./swagger_temp.yaml
 
-ID=$(echo "$API_DATA" | jq -r '.id')
+API_DATA=$(aws apigateway get-rest-apis --query "items[?name=='$API_NAME']" --output json)
+ID=$(echo "$API_DATA" | jq -r '.[0].id // empty')
 
-if [ -z ${ID} ];
-then
-    echo "Creando API Gateway $API_NAME"
-    
-    API_DATA=$(aws apigateway create-rest-api --name=$API_NAME \
+if [ -z "$ID" ]; then
+    API_RES=$(aws apigateway create-rest-api --name "$API_NAME" \
                         --endpoint-configuration "types=REGIONAL" \
                         --description "API Gateway servicio $SERVICE_NAME")
-
-    ID=$(echo "$API_DATA" | jq -r '.id')
-    echo "API gateway con Id: $ID, se ha creado"
-    echo "Creando Stage"
+    ID=$(echo "$API_RES" | jq -r '.id')
 fi
 
-#Reemplazo de valores para lambda authorizer
-cp ./$INPUT_SWAGGER_PATH ./swagger_temp.yaml
-
-sed -i 's/API_NAME/'$API_NAME'/g' ./swagger_temp.yaml
-
-sed -i 's/ACCOUNT_ID/'$ACCOUNT_ID'/g'  ./swagger_temp.yaml
-
-sed -i 's/REGION/'$AWS_DEFAULT_REGION'/g'  ./swagger_temp.yaml
-
-# Reemplazo de variable CORS DOMAIN
-sed -i 's/CORS_DOMAIN/'$INPUT_CORS_DOMAIN'/g' ./swagger_temp.yaml
-
-cat  ./swagger_temp.yaml
-
-if [[ "$OSTYPE" == "linux-gnu"* ]];
-then
-    echo "$OSTYPE"
-    base64 ./swagger_temp.yaml > ./swager_body.b64
+if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+    base64 -w 0 ./swagger_temp.yaml > ./swagger_body.b64
 else
-    base64 -i ./swagger_temp.yaml -o ./swager_body.b64
+    base64 ./swagger_temp.yaml > ./swagger_body.b64
 fi
 
-echo "Actualizando API $ID"
+aws apigateway put-rest-api --rest-api-id "$ID" --mode overwrite --body "file://./swagger_temp.yaml"
 
-aws apigateway put-rest-api --rest-api-id $ID \
-        --body file://./swager_body.b64 
+EXISTS_DEPLOYMENT=$(aws apigateway get-deployments --rest-api-id "$ID" --query "items" --output json | jq '. | length')
 
-EXISTS_DEPLOYMENT=$(aws apigateway get-deployments --rest-api-id $ID | jq -r '.items | length ')
-
-echo "Deployment sobre API $ID"
-echo "VPC Link: $VPC_LINK_ID"
-echo "NLB: $EKS_SERVICE_HOSTNAME"
-echo "AUTH_FUNC:  $INPUT_AUTHORIZER_FUNCTION"
-echo "AUTH_ROL: $INPUT_AUTHORIZER_ROLE_NAME"
-
-
-if [ "${EXISTS_DEPLOYMENT}"=="0" ];
-then
-    echo "Creando deployment sobre"
-    echo "INPUT_STAGE_NAME=$INPUT_STAGE_NAME"
-    echo "INPUT_AUTHORIZER_FUNCTION=$INPUT_AUTHORIZER_FUNCTION"
-    echo "INPUT_AUTHORIZER_ROLE_NAME=$INPUT_AUTHORIZER_ROLE_NAME"
-
+if [ "$EXISTS_DEPLOYMENT" -eq 0 ]; then
     aws apigateway create-deployment \
-        --rest-api-id $ID \
-        --stage-name $INPUT_STAGE_NAME \
+        --rest-api-id "$ID" \
+        --stage-name "$INPUT_STAGE_NAME" \
         --variables "url=$EKS_SERVICE_HOSTNAME,vpcLinkId=$VPC_LINK_ID,cpat_authorizer=$INPUT_AUTHORIZER_FUNCTION,cpat_authorizer_role=$INPUT_AUTHORIZER_ROLE_NAME" 
 else
-    echo "Actualizando"
-    $DEPLOYMENT_ID=$(aws apigateway get-deployments --rest-api-id $ID | jq -r '.items[0] |  .id')
-    aws apigateway update-deployment \
-        --rest-api-id $ID \
-        --deployment-id $DEPLOYMENT_ID
+    DEPLOYMENT_ID=$(aws apigateway get-deployments --rest-api-id "$ID" --query "items[0].id" --output text)
+    aws apigateway create-deployment --rest-api-id "$ID" --stage-name "$INPUT_STAGE_NAME"
 fi
