@@ -1,4 +1,4 @@
-name: "🛡️ DevSecOps Pipeline - Ligas Mayores"
+name: "DevSecOps Pipeline"
 
 on:
   workflow_dispatch:
@@ -43,19 +43,25 @@ jobs:
           sarif_file: semgrep.sarif
         if: always()
 
-  # --- FASE 3: INFRAESTRUCTURA (IaC) ---
+# --- FASE 3: INFRAESTRUCTURA (IaC) CORREGIDA ---
   infrastructure-audit:
     name: "🏗️ Checkov & Trivy IaC"
     runs-on: ubuntu-latest
     needs: sast-audit
     steps:
       - uses: actions/checkout@v4
-      - name: Checkov Scan
+      
+      - name: Run Checkov
         uses: bridgecrewio/checkov-action@master
         with:
           directory: .
           framework: all 
           soft_fail: false 
+          # CAMBIO CLAVE: Desactivamos la descarga de módulos externos que causan el error de credenciales
+          download_external_modules: false 
+          # Opcional: Si necesitas módulos externos, usa la siguiente línea (requiere un PAT)
+          # github_pat: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Trivy FS Scan
         uses: aquasecurity/trivy-action@master
         with:
