@@ -25,25 +25,24 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  sast-audit:
+sast-audit:
     name: "💻 Semgrep AppSec Scan"
     runs-on: ubuntu-latest
     needs: secrets-audit
     steps:
       - uses: actions/checkout@v4
+      
       - name: Semgrep Security Scan
-        uses: returntocorp/semgrep-action@v1
-        with:
-          # Se corrigió: eliminamos generateSarif y usamos reglas oficiales
-          config: >-
-            p/default
-            p/security-audit
-            p/secrets
-      # Subida de resultados optimizada a v4
+        # Usamos la imagen oficial de Docker para tener control total sobre el output
+        run: |
+          docker run --rm -v $(pwd):/src returntocorp/semgrep \
+          semgrep scan --config auto --sarif --output=semgrep.sarif
+          
       - name: Upload SARIF report
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: semgrep.sarif
+        # Importante: siempre subir el reporte, incluso si Semgrep encuentra fallos
         if: always()
 
   infrastructure-audit:
