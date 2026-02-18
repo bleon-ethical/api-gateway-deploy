@@ -44,7 +44,7 @@ sast-audit:
           sarif_file: semgrep.sarif
         # Importante: siempre subir el reporte, incluso si Semgrep encuentra fallos
         if: always()
-
+        
   infrastructure-audit:
     name: "🏗️ Checkov & Trivy IaC"
     runs-on: ubuntu-latest
