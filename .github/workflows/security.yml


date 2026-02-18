@@ -1,28 +1,47 @@
-name: "SecVu"
+name: "🛡️ Advanced DevSecOps Pipeline - Ligas Mayores"
 
 on:
+  # Permite ejecución manual desde la pestaña Actions
+  workflow_dispatch:
+    inputs:
+      scan_depth:
+        description: 'Profundidad del escaneo de secretos'
+        required: true
+        default: '0'
+        type: string
+  # Permite que otros repositorios llamen a este pipeline
+  workflow_call:
   push:
     branches: [ main, master, develop ]
   pull_request:
     branches: [ main ]
   schedule:
-    - cron: '0 0 * * 1' # Escaneo profundo todos los lunes a medianoche
+    - cron: '0 0 * * 1'
+
+# Permisos granulares para máxima seguridad (Principio de Menor Privilegio)
+permissions:
+  contents: read
+  security-events: write # Para subir reportes a la pestaña Security
+  id-token: write
 
 jobs:
-  # --- FASE 1: SECRETOS Y CREDENCIALES ---
+  # --- FASE 1: SECRETOS (BLOQUEO INMEDIATO) ---
   secrets-audit:
     name: "🔑 Gitleaks Secret Scan"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Necesario para escanear todo el historial de Git
+          fetch-depth: ${{ github.event.inputs.scan_depth || 0 }}
       - name: Gitleaks Scan
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Si encuentra una llave de AWS en el script, el pipeline muere aquí.
+        with:
+          fail-on-vulnerabilities: true 
 
-  # --- FASE 2: ANÁLISIS ESTÁTICO DE CÓDIGO (SAST) ---
+  # --- FASE 2: ANÁLISIS DE CÓDIGO (SAST) ---
   sast-audit:
     name: "💻 Semgrep AppSec Scan"
     runs-on: ubuntu-latest
@@ -32,76 +51,66 @@ jobs:
       - name: Semgrep Security Scan
         uses: returntocorp/semgrep-action@v1
         with:
-          # p/security-audit y p/secrets son reglas de nivel experto
+          # Detectará la inyección en el 'sed' del api-gateway
           config: >-
             p/default
             p/security-audit
             p/secrets
-            p/ci
+            p/owasp-top-ten
           generateSarif: "1"
       - name: Upload SARIF report
-        uses: github/codeql-action/upload-sarif@v2
+        uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: semgrep.sarif
         if: always()
 
-  # --- FASE 3: SEGURIDAD DE INFRAESTRUCTURA (IaC) ---
+  # --- FASE 3: INFRAESTRUCTURA Y DOCKER (IaC) ---
   infrastructure-audit:
-    name: "🏗️ Checkov IaC Hardening"
+    name: "🏗️ Checkov & Trivy IaC"
     runs-on: ubuntu-latest
     needs: sast-audit
     steps:
       - uses: actions/checkout@v4
-      - name: Run Checkov
+      - name: Checkov Scan (EKS & API Gateway)
         uses: bridgecrewio/checkov-action@master
         with:
           directory: .
-          framework: all # Escanea Docker, Kubernetes, Terraform y Shell
-          quiet: false
-          soft_fail: false # Detiene el pipeline si hay errores críticos
-          download_external_modules: true
+          framework: all 
+          soft_fail: false # Hard stop si la nube está mal configurada
+      
+      - name: Trivy FS & Config Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'config,fs'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
 
-  # --- FASE 4: VULNERABILIDADES EN CONTENEDORES (SCA) ---
-  container-audit:
-    name: "📦 Trivy Container Security"
+  # --- FASE 4: CADENA DE SUMINISTRO (PUNTUACIÓN CISO) ---
+  supply-chain:
+    name: "🔗 OpenSSF Scorecard"
     runs-on: ubuntu-latest
     needs: infrastructure-audit
     steps:
       - uses: actions/checkout@v4
-      - name: Scan Dockerfile and Filesystem
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: 'fs,config'
-          format: 'table'
-          exit-code: '1' # Falla si hay vulnerabilidades críticas
-          severity: 'CRITICAL,HIGH'
-          vuln-type: 'os,library'
-
-  # --- FASE 5: SEGURIDAD DE LA CADENA DE SUMINISTRO ---
-  supply-chain-audit:
-    name: "🔗 StepSecurity & OpenSSF"
-    runs-on: ubuntu-latest
-    needs: container-audit
-    steps:
-      - uses: actions/checkout@v4
-      - name: OpenSSF Scorecard Action
-        uses: ossf/scorecard-action@v2.0.6
+      - name: "Run Analysis"
+        uses: ossf/scorecard-action@v2.3.1
         with:
           results_file: results.sarif
           results_format: sarif
-          # Analiza la salud y seguridad del mantenimiento del repo
           publish_results: true
 
-  # --- FASE 6: AUDITORÍA DE DEPENDENCIAS (Snyk) ---
+  # --- FASE 5: DEPENDENCIAS Y BINARIOS (Snyk) ---
   dependency-audit:
-    name: "🧪 Snyk Dependency Scan"
+    name: "🧪 Snyk & Compliance"
     runs-on: ubuntu-latest
-    needs: supply-chain-audit
+    needs: supply-chain
+    # Solo corre si tenemos el token, así evitamos que el job falle por falta de config
+    if: "${{ secrets.SNYK_TOKEN != '' }}"
     steps:
       - uses: actions/checkout@v4
-      - name: Run Snyk to check for vulnerabilities
-        uses: snyk/actions/node@master # Ajustar según el lenguaje (python, java, go)
+      - name: Run Snyk Test
+        uses: snyk/actions/node@master
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         with:
-          command: monitor # Envía los reportes al dashboard de Snyk
+          args: --severity-threshold=high
