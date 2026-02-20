@@ -1,0 +1,67 @@
+name: "AuditGob"
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  security-events: write
+  id-token: write
+
+jobs:
+  secrets-audit:
+    name: "🔑 Gitleaks Secret Scan"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Gitleaks Scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  sast-audit:
+    name: "Semgrep AppSec Scan"
+    runs-on: ubuntu-latest
+    needs: secrets-audit
+    steps:
+      - uses: actions/checkout@v4
+      - name: Semgrep Security Scan
+        run: |
+          docker run --rm -v $(pwd):/src returntocorp/semgrep \
+          semgrep scan --config auto --sarif --output=semgrep.sarif
+      - name: Upload SARIF report
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: semgrep.sarif
+        if: always()
+
+  infrastructure-audit:
+    name: "Checkov & Trivy IaC"
+    runs-on: ubuntu-latest
+    needs: sast-audit
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: all 
+          soft_fail: false 
+          # CAMBIO CLAVE: Desactivamos la descarga de módulos externos que causan el error de credenciales
+          download_external_modules: false 
+
+      - name: Trivy FS Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'table'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
